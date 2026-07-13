@@ -1,0 +1,142 @@
+name: ec_ci
+run-name: EC CI for ${{ github.event.client_payload.private_ref_name || inputs.private_ref }}
+
+on:
+  repository_dispatch:
+    types:
+      - ec_ci
+  workflow_dispatch:
+    inputs:
+      private_ref:
+        description: "ec branch, tag, or SHA to test"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-ci-${{ github.event.client_payload.private_ref_name || inputs.private_ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      private_ref: ${{ steps.context.outputs.private_ref }}
+      source_label: ${{ steps.context.outputs.source_label }}
+    steps:
+      - name: resolve_private_context
+        id: context
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_PRIVATE_SHA: ${{ github.event.client_payload.private_sha }}
+          DISPATCH_PRIVATE_REF_NAME: ${{ github.event.client_payload.private_ref_name }}
+          INPUT_PRIVATE_REF: ${{ inputs.private_ref }}
+        run: |
+          if [[ "${EVENT_NAME}" == "repository_dispatch" ]]; then
+            private_ref="${DISPATCH_PRIVATE_SHA}"
+            source_label="${DISPATCH_PRIVATE_REF_NAME}"
+          else
+            private_ref="${INPUT_PRIVATE_REF}"
+            source_label="${INPUT_PRIVATE_REF}"
+          fi
+
+          if [[ -z "${private_ref}" ]]; then
+            echo "The private ec ref is empty." >&2
+            exit 1
+          fi
+
+          echo "private_ref=${private_ref}" >> "${GITHUB_OUTPUT}"
+          echo "source_label=${source_label}" >> "${GITHUB_OUTPUT}"
+
+  build_and_test:
+    needs: prepare
+    name: build (${{ matrix.os }}, Release, ${{ matrix.compiler_name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler_name: gcc
+            c_compiler: gcc
+            cpp_compiler: g++
+          - os: ubuntu-latest
+            compiler_name: clang
+            c_compiler: clang
+            cpp_compiler: clang++
+          - os: windows-latest
+            compiler_name: msvc
+            c_compiler: cl
+            cpp_compiler: cl
+
+    steps:
+      - name: checkout_private_ec
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: jackie117/ec
+          ref: ${{ needs.prepare.outputs.private_ref }}
+          ssh-key: ${{ secrets.EC_DEPLOY_KEY }}
+          path: ec
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: install_cmake
+        uses: lukka/get-cmake@bb2faa721a800324b726fec00f7c1ff7641964d1 # v4.2.0
+        with:
+          cmakeVersion: "~4.2.0"
+
+      - name: set_reusable_paths
+        id: paths
+        shell: bash
+        run: echo "build_output_dir=${{ github.workspace }}/build" >> "${GITHUB_OUTPUT}"
+
+      - name: configure_cmake
+        run: >
+          cmake -B "${{ steps.paths.outputs.build_output_dir }}"
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DZERO_BUILD_TESTS=ON
+          -S "${{ github.workspace }}/ec"
+
+      - name: build
+        run: cmake --build "${{ steps.paths.outputs.build_output_dir }}" --config Release
+
+      - name: test
+        if: ${{ matrix.os != 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        run: ctest --build-config Release --timeout 600 --output-on-failure --no-tests=error
+
+      - name: test_windows_release
+        if: ${{ matrix.os == 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 迁移时保留私有仓现有边界：这些测试在 Windows/MSVC Release 下会挂起。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          -E "^zero_loglib.*_pattern_formatter_test$"
+
+      - name: summarize_public_result
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PRIVATE_REF: ${{ needs.prepare.outputs.private_ref }}
+          SOURCE_LABEL: ${{ needs.prepare.outputs.source_label }}
+        run: |
+          {
+            echo "### EC public CI"
+            echo
+            echo "- Source label: \`${SOURCE_LABEL}\`"
+            echo "- Private ref: \`${PRIVATE_REF}\`"
+            echo "- Matrix: \`${{ matrix.os }} / ${{ matrix.compiler_name }} / Release\`"
+            echo "- The private ec source exists only in this temporary runner workspace."
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -109,20 +109,56 @@ jobs:
       - name: build
         run: cmake --build "${{ steps.paths.outputs.build_output_dir }}" --config Release
 
-      - name: test
+      - name: test_serial
         if: ${{ matrix.os != 'windows-latest' }}
         working-directory: ${{ steps.paths.outputs.build_output_dir }}
-        run: ctest --build-config Release --timeout 600 --output-on-failure --no-tests=error
+        # 串行段：timing 敏感的 threading 同步原语用例（serial 标签）在 CPU 争用下易 flaky，单独串行执行。
+        # --no-tests=error 防止 serial 标签失效后本段静默变空。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          -L "serial"
 
-      - name: test_windows_release
+      - name: test_parallel
+        if: ${{ matrix.os != 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 并行段：其余用例（引擎 gtest 套件与嵌套构建型 loglib/导出消费者测试）彼此独立；runner 为 4 vCPU，4 路并行。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          -LE "serial"
+          --parallel 4
+
+      - name: test_windows_serial
         if: ${{ matrix.os == 'windows-latest' }}
         working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 串行段：timing 敏感的 threading 同步原语用例（serial 标签）在 CPU 争用下易 flaky，单独串行执行。
+        # --no-tests=error 防止 serial 标签失效后本段静默变空。
         # 迁移时保留私有仓现有边界：这些测试在 Windows/MSVC Release 下会挂起。
         run: >
           ctest --build-config Release
           --timeout 600
           --output-on-failure
           --no-tests=error
+          -L "serial"
+          -E "^zero_loglib.*_pattern_formatter_test$"
+
+      - name: test_windows_parallel
+        if: ${{ matrix.os == 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 并行段：其余用例（引擎 gtest 套件与嵌套构建型 loglib/导出消费者测试）彼此独立；runner 为 4 vCPU，4 路并行。
+        # 迁移时保留私有仓现有边界：这些测试在 Windows/MSVC Release 下会挂起。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          -LE "serial"
+          --parallel 4
           -E "^zero_loglib.*_pattern_formatter_test$"
 
       - name: summarize_public_result

@@ -165,26 +165,26 @@ jobs:
       - name: test_windows_parallel_shard_a
         if: ${{ matrix.shard == 'A' }}
         working-directory: ${{ steps.paths.outputs.build_output_dir }}
-        # 并行段 shard A（install_export 重场景族 + 三个大单体）：-R 精确选择本桶测试；runner 为 4 vCPU，4 路并行。
-        # 分桶依据（ecp run 37934584083 实测）：install_export consumers 647.8s、aliases 576.4s、
-        # output_name_collision 217s、identity 193s、metadata 133s、multiconfig 124s，两桶各约 1720s CPU。
-        # 拆分后新测试名（_install/_gN 后缀）都落在 install_export_test_<scenario> 前缀下，正则天然兼容；
-        # 调整分桶时改这一处正则（并与 shard B 的 -E 保持互补）。
+        # 并行段 shard A（install_export 两大场景族 consumers/aliases，含 _install/_gN 拆分名）：-R 精确选择；
+        # runner 为 4 vCPU，4 路并行。两族各自 producer 先行、组间并行的 fixture 链是本桶时长主体。
+        # 分桶依据：拆分前实测（run 37934584083）consumers 647.8s + aliases 576.4s 为最大单体；
+        # 首轮分桶（含 metadata+三单体）A 段 518s vs B 段 249s 偏重（run 38144000934），
+        # 故 A 只留两族、metadata 与大单体归 B。调整分桶时改这一处正则（并与 shard B 的 -E 保持互补）。
         run: >
           ctest --build-config Release
           --timeout 600
           --output-on-failure
           --no-tests=error
           --parallel 4
-          -R "^zero_loglib_.*(install_export_test_(consumers|aliases|metadata)|output_name_collision_test|public_header_isolation_test|ec_root_friendly_target_build_test)"
+          -R "^zero_loglib_.*install_export_test_(consumers|aliases)"
 
       - name: test_windows_parallel_shard_b
         if: ${{ matrix.shard == 'B' }}
         working-directory: ${{ steps.paths.outputs.build_output_dir }}
-        # 并行段 shard B（其余全部：identity/multiconfig + 其余嵌套构建型用例 + 全部 gtest 套件）。
+        # 并行段 shard B（其余全部：metadata/identity/multiconfig + 各嵌套单体 + 全部 gtest 套件）。
         # 迁移时保留私有仓现有边界：pattern_formatter 在 Windows/MSVC Release 下会挂起，排除随本段保留。
-        # -E 把既有 pattern_formatter 排除与 shard A 的选取集并入同一正则，保证两 shard 并集=全集、无重叠；
-        # 调整分桶时与 shard A 的 -R 同步修改。
+        # -E 把既有 pattern_formatter 排除与 shard A 的选取集（consumers/aliases 两族）并入同一正则，
+        # 保证两 shard 并集=全集、无重叠；调整分桶时与 shard A 的 -R 同步修改。
         run: >
           ctest --build-config Release
           --timeout 600
@@ -192,7 +192,7 @@ jobs:
           --no-tests=error
           --parallel 4
           -LE "serial"
-          -E "^zero_loglib_.*(pattern_formatter_test$|install_export_test_(consumers|aliases|metadata)|output_name_collision_test|public_header_isolation_test|ec_root_friendly_target_build_test)"
+          -E "^zero_loglib_.*(pattern_formatter_test$|install_export_test_(consumers|aliases))"
 
       - name: summarize_public_result
         if: ${{ always() }}

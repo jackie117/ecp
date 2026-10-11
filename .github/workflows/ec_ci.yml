@@ -55,25 +55,40 @@ jobs:
 
   build_and_test:
     needs: prepare
-    name: build (${{ matrix.os }}, Release, ${{ matrix.compiler_name }})
+    # Windows 拆双分片（shard A/B）各自完整构建并均衡分跑测试；ubuntu 无 shard 字段，
+    # 表达式短路后 name 段为空，gcc/clang 的显示名保持原样不变。
+    name: build (${{ matrix.os }}, Release, ${{ matrix.compiler_name }}${{ matrix.shard != '' && format(', shard {0} ({1})', matrix.shard, matrix.shard_label) || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ubuntu 不分片：shard 显式置空串，保证 name 表达式 matrix.shard != '' 短路
+          # （缺失键在 GitHub 表达式中求值为 null，null != '' 为 true 会误渲染 shard 段）。
           - os: ubuntu-latest
             compiler_name: gcc
             c_compiler: gcc
             cpp_compiler: g++
+            shard: ''
           - os: ubuntu-latest
             compiler_name: clang
             c_compiler: clang
             cpp_compiler: clang++
+            shard: ''
+          # Windows 拆两个分片条目（各自完整 checkout/configure/build，测试按 shard 分流）。
           - os: windows-latest
             compiler_name: msvc
             c_compiler: cl
             cpp_compiler: cl
+            shard: A
+            shard_label: install-export-heavy
+          - os: windows-latest
+            compiler_name: msvc
+            c_compiler: cl
+            cpp_compiler: cl
+            shard: B
+            shard_label: rest
 
     steps:
       - name: checkout_private_ec
@@ -147,19 +162,37 @@ jobs:
           -L "serial"
           -E "^zero_loglib.*_pattern_formatter_test$"
 
-      - name: test_windows_parallel
-        if: ${{ matrix.os == 'windows-latest' }}
+      - name: test_windows_parallel_shard_a
+        if: ${{ matrix.shard == 'A' }}
         working-directory: ${{ steps.paths.outputs.build_output_dir }}
-        # 并行段：其余用例（引擎 gtest 套件与嵌套构建型 loglib/导出消费者测试）彼此独立；runner 为 4 vCPU，4 路并行。
-        # 迁移时保留私有仓现有边界：这些测试在 Windows/MSVC Release 下会挂起。
+        # 并行段 shard A（install_export 重场景族 + 三个大单体）：-R 精确选择本桶测试；runner 为 4 vCPU，4 路并行。
+        # 分桶依据（ecp run 37934584083 实测）：install_export consumers 647.8s、aliases 576.4s、
+        # output_name_collision 217s、identity 193s、metadata 133s、multiconfig 124s，两桶各约 1720s CPU。
+        # 拆分后新测试名（_install/_gN 后缀）都落在 install_export_test_<scenario> 前缀下，正则天然兼容；
+        # 调整分桶时改这一处正则（并与 shard B 的 -E 保持互补）。
         run: >
           ctest --build-config Release
           --timeout 600
           --output-on-failure
           --no-tests=error
-          -LE "serial"
           --parallel 4
-          -E "^zero_loglib.*_pattern_formatter_test$"
+          -R "^zero_loglib_.*(install_export_test_(consumers|aliases|metadata)|output_name_collision_test|public_header_isolation_test|ec_root_friendly_target_build_test)"
+
+      - name: test_windows_parallel_shard_b
+        if: ${{ matrix.shard == 'B' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 并行段 shard B（其余全部：identity/multiconfig + 其余嵌套构建型用例 + 全部 gtest 套件）。
+        # 迁移时保留私有仓现有边界：pattern_formatter 在 Windows/MSVC Release 下会挂起，排除随本段保留。
+        # -E 把既有 pattern_formatter 排除与 shard A 的选取集并入同一正则，保证两 shard 并集=全集、无重叠；
+        # 调整分桶时与 shard A 的 -R 同步修改。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          --parallel 4
+          -LE "serial"
+          -E "^zero_loglib_.*(pattern_formatter_test$|install_export_test_(consumers|aliases|metadata)|output_name_collision_test|public_header_isolation_test|ec_root_friendly_target_build_test)"
 
       - name: summarize_public_result
         if: ${{ always() }}

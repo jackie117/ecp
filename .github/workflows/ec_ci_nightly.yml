@@ -1,0 +1,244 @@
+name: ec_ci_nightly
+run-name: EC CI nightly full pass
+
+on:
+  schedule:
+    # 每日 UTC 20:00（北京 04:00）全量回归。PR 路径（ec_ci.yml）已排除 nightly 标签的
+    # loglib 嵌套构建型用例，这类用例只在本 workflow 全量执行。
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "ec branch, tag, or SHA to test"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ec-ci-nightly
+  cancel-in-progress: true
+
+jobs:
+  build_and_test:
+    # schedule 事件没有 inputs/client_payload，checkout ref 固定 main；
+    # workflow_dispatch 可选传入分支/tag/SHA（inputs.ref 为空时同样回退 main）。
+    name: build (${{ matrix.os }}, Release, ${{ matrix.compiler_name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 矩阵与 ec_ci.yml 保持一致（gcc/clang/msvc 三平台单条目、无分片），夜间全量不缩减覆盖面。
+          # compiler_launcher 按平台注入编译器缓存工具：ubuntu=ccache，Windows/MSVC=sccache
+          # （ccache 对 cl.exe 支持不完整），经 CMAKE_*_COMPILER_LAUNCHER 生效，CMakeLists 零改动。
+          - os: ubuntu-latest
+            compiler_name: gcc
+            c_compiler: gcc
+            cpp_compiler: g++
+            compiler_launcher: ccache
+          - os: ubuntu-latest
+            compiler_name: clang
+            c_compiler: clang
+            cpp_compiler: clang++
+            compiler_launcher: ccache
+          - os: windows-latest
+            compiler_name: msvc
+            c_compiler: cl
+            cpp_compiler: cl
+            compiler_launcher: sccache
+    env:
+      # 编译器缓存目录与大小上限，与 ec_ci.yml 完全一致：nightly 与 PR 路径共享同一缓存命名空间，
+      # 夜跑同样吃缓存并为其续期。按矩阵条件短路：另一平台的变量为空串且无工具读取，不影响执行。
+      # ubuntu-latest 的 HOME 固定为 /home/runner（GitHub runner 镜像保证），字面量与 cache_ccache 的 path 一致；
+      # sccache 在 Windows 不展开 ~，SCCACHE_DIR 必须用绝对路径，与 cache_sccache 的 path 保持同一写法。
+      CCACHE_DIR: ${{ matrix.os != 'windows-latest' && '/home/runner/.cache/ccache' || '' }}
+      SCCACHE_DIR: ${{ matrix.os == 'windows-latest' && format('{0}/.sccache', github.workspace) || '' }}
+      SCCACHE_CACHE_SIZE: 2G
+
+    steps:
+      - name: checkout_private_ec
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: jackie117/ec
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.EC_DEPLOY_KEY }}
+          path: ec
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: install_cmake
+        uses: lukka/get-cmake@bb2faa721a800324b726fec00f7c1ff7641964d1 # v4.2.0
+        with:
+          cmakeVersion: "~4.2.0"
+
+      - name: set_reusable_paths
+        id: paths
+        shell: bash
+        run: echo "build_output_dir=${{ github.workspace }}/build" >> "${GITHUB_OUTPUT}"
+
+      - name: install_ccache
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        # 同 ec_ci.yml：镜像通常预装 ccache，command -v 探测失败时兜底 apt 安装；
+        # 大小上限收紧到 2G（与 sccache 的 SCCACHE_CACHE_SIZE 对齐）。
+        run: |
+          command -v ccache || sudo apt-get install -y ccache
+          ccache -M 2G
+
+      - name: install_sccache
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: bash
+        # MSVC 下用 sccache（ccache 对 cl.exe 支持不完整）；choco 由 Windows runner 预装，安装秒级。
+        run: choco install sccache -y
+
+      # 恢复编译器缓存，key 与 ec_ci.yml 相同（同一命名空间）：nightly 也吃 PR 路径积累的缓存，
+      # 同时为全量构建续期。私有仓 checkout 在 workspace/ec 子目录，hashFiles 模式必须带 ec/ 前缀。
+      - name: cache_ccache
+        id: cache_ccache
+        if: ${{ matrix.os != 'windows-latest' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /home/runner/.cache/ccache
+          key: ${{ matrix.os }}-${{ matrix.compiler_name }}-ccache-${{ hashFiles('ec/**/CMakeLists.txt', 'ec/source/**') }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.compiler_name }}-ccache-
+
+      - name: cache_sccache
+        id: cache_sccache
+        if: ${{ matrix.os == 'windows-latest' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ matrix.os }}-${{ matrix.compiler_name }}-sccache-${{ hashFiles('ec/**/CMakeLists.txt', 'ec/source/**') }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.compiler_name }}-sccache-
+
+      - name: configure_cmake
+        # 同 ec_ci.yml：launcher 注入编译器缓存（ccache/sccache 按矩阵），不替换编译器路径、零侵入。
+        run: >
+          cmake -B "${{ steps.paths.outputs.build_output_dir }}"
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
+          -DCMAKE_C_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
+          -DCMAKE_CXX_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DZERO_BUILD_TESTS=ON
+          -S "${{ github.workspace }}/ec"
+
+      - name: build
+        run: cmake --build "${{ steps.paths.outputs.build_output_dir }}" --config Release
+
+      # 缓存目录/上限/命中情况与统计写入 step summary，便于核对缓存收益与命中率。
+      - name: show_ccache_stats
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache_ccache.outputs.cache-hit }}
+        run: |
+          {
+            echo "### 编译器缓存统计（ccache）"
+            echo
+            echo "- 缓存目录: \`${CCACHE_DIR}\`（上限 2G，ccache -M）"
+            echo "- 本次 restore: ${CACHE_HIT:-未精确命中（restore-keys 前缀匹配或冷缓存）}"
+            echo
+            echo '```'
+            ccache --show-stats
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: show_sccache_stats
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache_sccache.outputs.cache-hit }}
+        run: |
+          {
+            echo "### 编译器缓存统计（sccache）"
+            echo
+            echo "- 缓存目录: \`${SCCACHE_DIR}\`（上限 ${SCCACHE_CACHE_SIZE}）"
+            echo "- 本次 restore: ${CACHE_HIT:-未精确命中（restore-keys 前缀匹配或冷缓存）}"
+            echo
+            echo '```'
+            sccache --show-stats
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: test_serial_full
+        if: ${{ matrix.os != 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 夜间全量的串行段：serial 标签用例依赖独占调度时序（同 ec_ci.yml 串行段语义），
+        # 即使夜跑也不并行争用，避免时序误红淹没真回归信号。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          -L "serial"
+
+      - name: test_full
+        if: ${{ matrix.os != 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 夜间全量的并行段：其余全部（含 nightly 标签的 loglib 嵌套构建型用例）4 路并行。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          --parallel 4
+          -LE "serial"
+
+      - name: test_windows_serial_full
+        if: ${{ matrix.os == 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 夜间全量的 Windows 串行段：语义同 test_serial_full；保留 pattern_formatter
+        # 挂起排除边界（与 ec_ci.yml 一致）。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          -L "serial"
+          -E "^zero_loglib.*_pattern_formatter_test$"
+
+      - name: test_windows_full
+        if: ${{ matrix.os == 'windows-latest' }}
+        working-directory: ${{ steps.paths.outputs.build_output_dir }}
+        # 夜间全量的 Windows 并行段（语义同 test_full）；仅保留 Windows/MSVC Release 下
+        # 会挂起的 pattern_formatter 排除边界（与 ec_ci.yml 的串行/并行段一致）。
+        run: >
+          ctest --build-config Release
+          --timeout 600
+          --output-on-failure
+          --no-tests=error
+          --parallel 4
+          -LE "serial"
+          -E "^zero_loglib.*_pattern_formatter_test$"
+
+      - name: stop_sccache_server
+        if: ${{ always() && matrix.os == 'windows-latest' }}
+        shell: bash
+        # sccache 常驻 server 会持有缓存目录的文件句柄；构建/测试结束后停服，
+        # 确保 actions/cache 的 post 阶段保存缓存不被 Windows 文件锁阻断。
+        # server 从未启动的失败路径（如 configure 即失败）下停服会非零退出，
+        # || true 避免给已失败的 job 追加红步骤。
+        run: sccache --stop-server || true
+
+      - name: summarize_nightly_result
+        if: ${{ always() }}
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.ref || 'main' }}
+        run: |
+          {
+            echo "### EC CI nightly（全量回归）"
+            echo
+            echo "- Source ref: \`${SOURCE_REF}\`"
+            echo "- Matrix: \`${{ matrix.os }} / ${{ matrix.compiler_name }} / Release\`"
+            echo "- 全量 ctest（无 -L/-LE 排除；Windows 仅保留 pattern_formatter 挂起排除）"
+            echo "- The private ec source exists only in this temporary runner workspace."
+          } >> "${GITHUB_STEP_SUMMARY}"

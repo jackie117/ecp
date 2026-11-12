@@ -55,40 +55,40 @@ jobs:
 
   build_and_test:
     needs: prepare
-    # Windows 拆双分片（shard A/B）各自完整构建并均衡分跑测试；ubuntu 无 shard 字段，
-    # 表达式短路后 name 段为空，gcc/clang 的显示名保持原样不变。
-    name: build (${{ matrix.os }}, Release, ${{ matrix.compiler_name }}${{ matrix.shard != '' && format(', shard {0} ({1})', matrix.shard, matrix.shard_label) || '' }})
+    name: build (${{ matrix.os }}, Release, ${{ matrix.compiler_name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ubuntu 不分片：shard 显式置空串，保证 name 表达式 matrix.shard != '' 短路
-          # （缺失键在 GitHub 表达式中求值为 null，null != '' 为 true 会误渲染 shard 段）。
+          # 2026-11 撤并 Windows 双分片：install_export 全家族等嵌套构建型用例全部 nightly 化后，
+          # 原 shard A 的 -R 选取集清空、分桶对象消失，矩阵回到 gcc/clang/msvc 三个单条目
+          # （分级细节见 test_parallel / test_windows_parallel 注释与 ec_ci_nightly.yml）。
+          # compiler_launcher 按平台注入编译器缓存工具：ubuntu=ccache，Windows/MSVC=sccache
+          # （ccache 对 cl.exe 支持不完整），经 CMAKE_*_COMPILER_LAUNCHER 生效，CMakeLists 零改动。
           - os: ubuntu-latest
             compiler_name: gcc
             c_compiler: gcc
             cpp_compiler: g++
-            shard: ''
+            compiler_launcher: ccache
           - os: ubuntu-latest
             compiler_name: clang
             c_compiler: clang
             cpp_compiler: clang++
-            shard: ''
-          # Windows 拆两个分片条目（各自完整 checkout/configure/build，测试按 shard 分流）。
+            compiler_launcher: ccache
           - os: windows-latest
             compiler_name: msvc
             c_compiler: cl
             cpp_compiler: cl
-            shard: A
-            shard_label: install-export-heavy
-          - os: windows-latest
-            compiler_name: msvc
-            c_compiler: cl
-            cpp_compiler: cl
-            shard: B
-            shard_label: rest
+            compiler_launcher: sccache
+    env:
+      # 编译器缓存目录与大小上限。按矩阵条件短路：另一平台的变量为空串且无工具读取，不影响执行。
+      # ubuntu-latest 的 HOME 固定为 /home/runner（GitHub runner 镜像保证），字面量与 cache_ccache 的 path 一致；
+      # sccache 在 Windows 不展开 ~，SCCACHE_DIR 必须用绝对路径，与 cache_sccache 的 path 保持同一写法。
+      CCACHE_DIR: ${{ matrix.os != 'windows-latest' && '/home/runner/.cache/ccache' || '' }}
+      SCCACHE_DIR: ${{ matrix.os == 'windows-latest' && format('{0}/.sccache', github.workspace) || '' }}
+      SCCACHE_CACHE_SIZE: 2G
 
     steps:
       - name: checkout_private_ec
@@ -111,11 +111,53 @@ jobs:
         shell: bash
         run: echo "build_output_dir=${{ github.workspace }}/build" >> "${GITHUB_OUTPUT}"
 
+      - name: install_ccache
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        # ubuntu runner 镜像通常预装 ccache，command -v 探测失败时兜底 apt 安装；
+        # 大小上限收紧到 2G（与 sccache 的 SCCACHE_CACHE_SIZE 对齐，远小于 actions/cache 单分片 10G 上限）。
+        run: |
+          command -v ccache || sudo apt-get install -y ccache
+          ccache -M 2G
+
+      - name: install_sccache
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: bash
+        # MSVC 下用 sccache（ccache 对 cl.exe 支持不完整）；choco 由 Windows runner 预装，安装秒级。
+        run: choco install sccache -y
+
+      # 恢复编译器缓存（仅目标文件等中间产物）。key 绑定矩阵标识（os+编译器+缓存工具）与私有仓源码哈希；
+      # 私有仓 checkout 在 workspace/ec 子目录，hashFiles 模式必须带 ec/ 前缀才能命中私有仓文件。
+      # 源码哈希失配时按 restore-keys 前缀部分命中，保留增量编译收益；恢复失败退化为无缓存全量构建，不影响正确性。
+      - name: cache_ccache
+        id: cache_ccache
+        if: ${{ matrix.os != 'windows-latest' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /home/runner/.cache/ccache
+          key: ${{ matrix.os }}-${{ matrix.compiler_name }}-ccache-${{ hashFiles('ec/**/CMakeLists.txt', 'ec/source/**') }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.compiler_name }}-ccache-
+
+      - name: cache_sccache
+        id: cache_sccache
+        if: ${{ matrix.os == 'windows-latest' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ matrix.os }}-${{ matrix.compiler_name }}-sccache-${{ hashFiles('ec/**/CMakeLists.txt', 'ec/source/**') }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.compiler_name }}-sccache-
+
       - name: configure_cmake
+        # launcher 注入编译器缓存（ccache/sccache 按矩阵），不替换编译器路径、对 CMakeLists 零侵入；
+        # 缓存 miss 时代码路径与无 launcher 时完全一致，只是慢。
         run: >
           cmake -B "${{ steps.paths.outputs.build_output_dir }}"
           -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
           -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
+          -DCMAKE_C_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
+          -DCMAKE_CXX_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=ON
           -DZERO_BUILD_TESTS=ON
@@ -123,6 +165,41 @@ jobs:
 
       - name: build
         run: cmake --build "${{ steps.paths.outputs.build_output_dir }}" --config Release
+
+      # 缓存目录/上限/命中情况与统计写入 step summary，便于核对缓存收益与命中率。
+      - name: show_ccache_stats
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache_ccache.outputs.cache-hit }}
+        run: |
+          {
+            echo "### 编译器缓存统计（ccache）"
+            echo
+            echo "- 缓存目录: \`${CCACHE_DIR}\`（上限 2G，ccache -M）"
+            echo "- 本次 restore: ${CACHE_HIT:-未精确命中（restore-keys 前缀匹配或冷缓存）}"
+            echo
+            echo '```'
+            ccache --show-stats
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: show_sccache_stats
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache_sccache.outputs.cache-hit }}
+        run: |
+          {
+            echo "### 编译器缓存统计（sccache）"
+            echo
+            echo "- 缓存目录: \`${SCCACHE_DIR}\`（上限 ${SCCACHE_CACHE_SIZE}）"
+            echo "- 本次 restore: ${CACHE_HIT:-未精确命中（restore-keys 前缀匹配或冷缓存）}"
+            echo
+            echo '```'
+            sccache --show-stats
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: test_serial
         if: ${{ matrix.os != 'windows-latest' }}
@@ -139,13 +216,17 @@ jobs:
       - name: test_parallel
         if: ${{ matrix.os != 'windows-latest' }}
         working-directory: ${{ steps.paths.outputs.build_output_dir }}
-        # 并行段：其余用例（引擎 gtest 套件与嵌套构建型 loglib/导出消费者测试）彼此独立；runner 为 4 vCPU，4 路并行。
+        # 并行段：其余用例（引擎 gtest 套件与运行型 loglib 测试）彼此独立；runner 为 4 vCPU，4 路并行。
+        # 测试分级（2026-11 起）：反复完整构建同一个库的 loglib 嵌套构建型用例（约占本段 90% CPU）已统一打
+        # nightly 标签，PR 路径排除、由 ec_ci_nightly.yml 每日全量回归。
+        # -LE 的值是 ctest 的 label 正则（OR 语义）："serial|nightly" = 排除带 serial 或 nightly 任一标签的用例；
+        # 引擎 gtest 套件不带标签，排除后本段仍非空，--no-tests=error 兜底不变。
         run: >
           ctest --build-config Release
           --timeout 600
           --output-on-failure
           --no-tests=error
-          -LE "serial"
+          -LE "serial|nightly"
           --parallel 4
 
       - name: test_windows_serial
@@ -162,38 +243,31 @@ jobs:
           -L "serial"
           -E "^zero_loglib.*_pattern_formatter_test$"
 
-      - name: test_windows_parallel_shard_a
-        if: ${{ matrix.shard == 'A' }}
+      - name: test_windows_parallel
+        if: ${{ matrix.os == 'windows-latest' }}
         working-directory: ${{ steps.paths.outputs.build_output_dir }}
-        # 并行段 shard A（install_export 全家族：拆分的 consumers/aliases（含 _install/_gN）+ 未拆的
-        # metadata/identity/multiconfig）：-R 精确选择；runner 为 4 vCPU，4 路并行。
-        # 分桶依据：拆分前实测（run 37934584083）consumers 647.8s + aliases 576.4s 为最大单体，
-        # identity 193s / metadata 133s / multiconfig 124s；两轮实测迭代（38144000934 A 518s/B 249s 偏重、
-        # 38145490224 A 299s/B 573s 反转偏重）后收敛为「install_export 全家族 vs 其余全部」。
-        # 调整分桶时改这一处正则（并与 shard B 的 -E 保持互补）。
+        # 并行段（2026-11 撤并双分片）：install_export 全家族等嵌套构建型用例全部 nightly 化后，
+        # 原 shard A 的 -R 选取集清空、分桶对象消失，回退为单 job 的全量并行段。
+        # -LE "serial|nightly"（label 正则，OR 语义）：排除 serial 串行用例与 nightly 分级用例
+        # （分级语义与 test_parallel 注释一致）；排除后引擎 gtest 套件仍非空，--no-tests=error 兜底不变。
+        # -E 保留 Windows/MSVC Release 下会挂起的 pattern_formatter 排除边界（迁移自原 shard B）。
         run: >
           ctest --build-config Release
           --timeout 600
           --output-on-failure
           --no-tests=error
+          -LE "serial|nightly"
+          -E "^zero_loglib.*_pattern_formatter_test$"
           --parallel 4
-          -R "^zero_loglib_.*install_export_test_(consumers|aliases|metadata|identity|multiconfig)"
 
-      - name: test_windows_parallel_shard_b
-        if: ${{ matrix.shard == 'B' }}
-        working-directory: ${{ steps.paths.outputs.build_output_dir }}
-        # 并行段 shard B（其余全部：非 install_export 的各嵌套构建型用例 + 全部 gtest 套件）。
-        # 迁移时保留私有仓现有边界：pattern_formatter 在 Windows/MSVC Release 下会挂起，排除随本段保留。
-        # -E 把既有 pattern_formatter 排除与 shard A 的选取集（install_export 全家族）并入同一正则，
-        # 保证两 shard 并集=全集、无重叠；调整分桶时与 shard A 的 -R 同步修改。
-        run: >
-          ctest --build-config Release
-          --timeout 600
-          --output-on-failure
-          --no-tests=error
-          --parallel 4
-          -LE "serial"
-          -E "^zero_loglib_.*(pattern_formatter_test$|install_export_test_(consumers|aliases|metadata|identity|multiconfig))"
+      - name: stop_sccache_server
+        if: ${{ always() && matrix.os == 'windows-latest' }}
+        shell: bash
+        # sccache 常驻 server 会持有缓存目录的文件句柄；构建/测试结束后停服，
+        # 确保 actions/cache 的 post 阶段保存缓存不被 Windows 文件锁阻断。
+        # server 从未启动的失败路径（如 configure 即失败）下停服会非零退出，
+        # || true 避免给已失败的 job 追加红步骤。
+        run: sccache --stop-server || true
 
       - name: summarize_public_result
         if: ${{ always() }}

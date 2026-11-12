@@ -161,6 +161,8 @@ jobs:
         # 统一 Ninja 生成器：实测 VS 生成器忽略 COMPILER_LAUNCHER（run 43199555708/43203147375
         # 中 sccache 零介入、缓存目录为空），Ninja/Makefile 生成器下 launcher 可靠生效；
         # ubuntu 顺带统一（默认 Makefiles 也支持 launcher，统一仅为减少矩阵分叉）。
+        # MSVC 调试信息强制 /Z7（Embedded）：CMake 默认 /Zi 独立 PDB，sccache 无法缓存该形态的
+        # cl 调用（run 43209402670 缓存精确命中但 build 仍 9m11s，命中率受限的根因）。
         run: >
           cmake -G Ninja
           -B "${{ steps.paths.outputs.build_output_dir }}"
@@ -169,6 +171,7 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
           -DCMAKE_CXX_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
           -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
           -DBUILD_TESTING=ON
           -DZERO_BUILD_TESTS=ON
           -S "${{ github.workspace }}/ec"

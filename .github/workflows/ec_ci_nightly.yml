@@ -128,6 +128,8 @@ jobs:
         # 统一 Ninja 生成器（VS 生成器忽略 COMPILER_LAUNCHER，sccache 零介入——实测
         # run 43199555708/43203147375）。注意：嵌套构建型 loglib 测试的父生成器由此变为 Ninja，
         # 含 MSBuild 专属断言的用例如有生成器门控应正常跳过，首轮 nightly 需重点观察。
+        # MSVC 调试信息强制 /Z7（Embedded）：CMake 默认 /Zi 独立 PDB，sccache 无法缓存该形态的
+        # cl 调用（run 43209402670 缓存精确命中但 build 仍 9m11s，命中率受限的根因）。
         run: >
           cmake -G Ninja
           -B "${{ steps.paths.outputs.build_output_dir }}"
@@ -136,6 +138,7 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
           -DCMAKE_CXX_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}
           -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
           -DBUILD_TESTING=ON
           -DZERO_BUILD_TESTS=ON
           -S "${{ github.workspace }}/ec"

@@ -126,6 +126,12 @@ jobs:
         # MSVC 下用 sccache（ccache 对 cl.exe 支持不完整）；choco 由 Windows runner 预装，安装秒级。
         run: choco install sccache -y
 
+      - name: setup_msvc
+        if: ${{ matrix.os == 'windows-latest' }}
+        # Ninja 生成器要求 cl.exe 出现在 PATH（无 VS 生成器的自动定位），此步骤导出 vcvars 环境
+        # （PATH/INCLUDE/LIB 等经 GITHUB_ENV/GITHUB_PATH 对后续所有步骤与 shell 生效）。
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
       # 恢复编译器缓存（仅目标文件等中间产物）。key 绑定矩阵标识（os+编译器+缓存工具）与私有仓源码哈希；
       # 私有仓 checkout 在 workspace/ec 子目录，hashFiles 模式必须带 ec/ 前缀才能命中私有仓文件。
       # 源码哈希失配时按 restore-keys 前缀部分命中，保留增量编译收益；恢复失败退化为无缓存全量构建，不影响正确性。
@@ -152,8 +158,12 @@ jobs:
       - name: configure_cmake
         # launcher 注入编译器缓存（ccache/sccache 按矩阵），不替换编译器路径、对 CMakeLists 零侵入；
         # 缓存 miss 时代码路径与无 launcher 时完全一致，只是慢。
+        # 统一 Ninja 生成器：实测 VS 生成器忽略 COMPILER_LAUNCHER（run 43199555708/43203147375
+        # 中 sccache 零介入、缓存目录为空），Ninja/Makefile 生成器下 launcher 可靠生效；
+        # ubuntu 顺带统一（默认 Makefiles 也支持 launcher，统一仅为减少矩阵分叉）。
         run: >
-          cmake -B "${{ steps.paths.outputs.build_output_dir }}"
+          cmake -G Ninja
+          -B "${{ steps.paths.outputs.build_output_dir }}"
           -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
           -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
           -DCMAKE_C_COMPILER_LAUNCHER=${{ matrix.compiler_launcher }}

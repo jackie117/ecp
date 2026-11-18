@@ -67,6 +67,10 @@ jobs:
           # （分级细节见 test_parallel / test_windows_parallel 注释与 ec_ci_nightly.yml）。
           # compiler_launcher 按平台注入编译器缓存工具：ubuntu=ccache，Windows/MSVC=sccache
           # （ccache 对 cl.exe 支持不完整），经 CMAKE_*_COMPILER_LAUNCHER 生效，CMakeLists 零改动。
+          # 2026-11-18 新增 macOS 条目（ec 仓库 macos 后端/CoreAudio 的首次编译验证依赖；
+          # PR #75 起）：v1 暂不接编译器缓存（首建必冷 + 缓存步骤的路径条件在无法本地预验的
+          # 新平台上风险最大，launcher 置空直编；后续按需补 ccache+brew）。macos-latest =
+          # Apple Silicon arm64 runner（公共仓 macOS 分钟免费）；Apple clang 即 clang/clang++。
           - os: ubuntu-latest
             compiler_name: gcc
             c_compiler: gcc
@@ -77,6 +81,11 @@ jobs:
             c_compiler: clang
             cpp_compiler: clang++
             compiler_launcher: ccache
+          - os: macos-latest
+            compiler_name: appleclang
+            c_compiler: clang
+            cpp_compiler: clang++
+            compiler_launcher: ''
           - os: windows-latest
             compiler_name: msvc
             c_compiler: cl
@@ -86,7 +95,8 @@ jobs:
       # 编译器缓存目录与大小上限。按矩阵条件短路：另一平台的变量为空串且无工具读取，不影响执行。
       # ubuntu-latest 的 HOME 固定为 /home/runner（GitHub runner 镜像保证），字面量与 cache_ccache 的 path 一致；
       # sccache 在 Windows 不展开 ~，SCCACHE_DIR 必须用绝对路径，与 cache_sccache 的 path 保持同一写法。
-      CCACHE_DIR: ${{ matrix.os != 'windows-latest' && '/home/runner/.cache/ccache' || '' }}
+      # macOS（2026-11-18 条目）不接缓存：launcher 为空，CCACHE_DIR 同样为空串且无工具读取。
+      CCACHE_DIR: ${{ matrix.os == 'ubuntu-latest' && '/home/runner/.cache/ccache' || '' }}
       SCCACHE_DIR: ${{ matrix.os == 'windows-latest' && format('{0}/.sccache', github.workspace) || '' }}
       SCCACHE_CACHE_SIZE: 2G
 
@@ -112,10 +122,12 @@ jobs:
         run: echo "build_output_dir=${{ github.workspace }}/build" >> "${GITHUB_OUTPUT}"
 
       - name: install_ccache
-        if: ${{ matrix.os != 'windows-latest' }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         shell: bash
         # ubuntu runner 镜像通常预装 ccache，command -v 探测失败时兜底 apt 安装；
         # 大小上限收紧到 2G（与 sccache 的 SCCACHE_CACHE_SIZE 对齐，远小于 actions/cache 单分片 10G 上限）。
+        # 条件从「非 windows」收窄为「仅 ubuntu」（2026-11-18 macOS 条目加入后 apt 在 macOS 不可用；
+        # macOS v1 不接缓存，见矩阵注释）。
         run: |
           command -v ccache || sudo apt-get install -y ccache
           ccache -M 2G
@@ -137,7 +149,7 @@ jobs:
       # 源码哈希失配时按 restore-keys 前缀部分命中，保留增量编译收益；恢复失败退化为无缓存全量构建，不影响正确性。
       - name: cache_ccache
         id: cache_ccache
-        if: ${{ matrix.os != 'windows-latest' }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: /home/runner/.cache/ccache
@@ -181,7 +193,7 @@ jobs:
 
       # 缓存目录/上限/命中情况与统计写入 step summary，便于核对缓存收益与命中率。
       - name: show_ccache_stats
-        if: ${{ matrix.os != 'windows-latest' }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         shell: bash
         env:
           CACHE_HIT: ${{ steps.cache_ccache.outputs.cache-hit }}
